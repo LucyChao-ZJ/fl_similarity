@@ -13,11 +13,19 @@ from torch.utils.data import DataLoader, Subset
 import logging
 
 device = torch.device("mps")
-
+EPOCHS = 50
 logging.basicConfig(filename="./output.txt", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-# CNN 模型
+def subtract_model(model1, model2):
+    model_diff = CNN()
+    state_dict1 = model1.state_dict()
+    state_dict2 = model2.state_dict()
+    state_dict_diff = {key: state_dict1[key] - state_dict2[key] for key in state_dict1.keys()}
+    model_diff.load_state_dict(state_dict_diff)
+    return model_diff
+
+
 class CNN(nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
@@ -33,7 +41,7 @@ class CNN(nn.Module):
         x = self.maxpool(x)
         x = self.relu(self.conv2(x))
         x = self.maxpool(x)
-        x = x.view(x.size(0), -1)  # 展平
+        x = x.view(x.size(0), -1)
         x = self.relu(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -41,40 +49,39 @@ class CNN(nn.Module):
 
 class Client:
     def __init__(self, data_loader, model, c_id):
-        self.his_model = [model]
         self.id = c_id
         self.data_loader = data_loader
         self.model = model
+        self.pre_model = model
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         self.loss_function = nn.CrossEntropyLoss()
+        self.cur_round = 0
 
     def train_local_model(self, epochs):
-        # 本地训练
         self.model.train()
         for epoch in range(epochs):
+            self.cur_round += 1
             running_loss = 0.0
             for inputs, labels in self.data_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
-
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
+                self.pre_model = copy.deepcopy(self.model)
                 loss = self.loss_function(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
-                self.his_model.append(model)
                 running_loss += loss.item()
 
-            print(f"Client {self.id} - Epoch {epoch + 1}, Loss: {running_loss / len(self.data_loader)}")
-
+            print(f"Client {self.id} - Epoch {self.cur_round}, Loss: {running_loss / len(self.data_loader)}")
 
 # 计算相似度
-def calculate_similarity(model1, model2, metric="cosine"):
+def cal_model_sim(model1, model2, metric="cos"):
     params1 = get_model_params(model1)
     params2 = get_model_params(model2)
 
-    if metric == "cosine":
+    if metric == "cos":
         return cosine_similarity([params1], [params2])[0][0]
-    elif metric == "euclidean":
+    elif metric == "euc":
         return euclidean(params1, params2)
     elif metric == "kl":
         return np.sum(entropy(params1, params2))
@@ -100,7 +107,7 @@ def split_cifar100(batch_size=32):
     client_data = []
     vis = {_: 0 for _ in range(60001)}
     for client_id in range(6):
-        if client_id < 3:  # 客户端 A, B, C
+        if client_id < 3:  # 客户端 A, B, C为数据分布相似
             cnt = {_: 0 for _ in range(101)}
             indices = []
             for i in range(len(train_data)):
@@ -109,7 +116,7 @@ def split_cifar100(batch_size=32):
                     indices.append(i)
                     cnt[train_data.targets[i]] += 1
             indices = np.array(indices)
-        else:  # 客户端 D，E,F
+        else:  # 客户端 D，E,F为数据分布不相似
             indices = np.array([i for i in range(len(train_data)) if (train_data.targets[i] >= (client_id - 3) * 20) & (
                     train_data.targets[i] < (client_id - 2) * 20)])
 
@@ -120,45 +127,57 @@ def split_cifar100(batch_size=32):
     return client_loaders
 
 
-def train_and_evaluate(clients, epochs):
-    n_clients = len(clients)
-    similarities = {"cosine": [[None for _ in range(n_clients)] for _ in range(n_clients)],
-                    "euclidean": [[None for _ in range(n_clients)] for _ in range(n_clients)],
-                    "kl": [[None for _ in range(n_clients)] for _ in range(n_clients)]}
+# def aggregate(clients):
+#     if len(clients) == 0:
+#         return None
+#     avg_model = copy.deepcopy(clients[0])
+#
+#     with torch.no_grad():
+#         for param_name, param in avg_model.named_parameters():
+#             param.data.zero_()
+#             for model in clients:
+#                 param.data += model.state_dict()[param_name] / len(clients)
+#
+#     return avg_model
 
-    for client in clients:
-        client.train_local_model(epochs)
+
+def get_similarities(clients, target="m"):
+    n_clients = len(clients)
+
+    similarities = {"cos": [[None for _ in range(n_clients)] for _ in range(n_clients)],
+                    "euc": [[None for _ in range(n_clients)] for _ in range(n_clients)],
+                    "kl": [[None for _ in range(n_clients)] for _ in range(n_clients)]}
 
     for i, client1 in enumerate(clients):
         for j, client2 in enumerate(clients):
             if i <= j:
-                cos_sim = calculate_similarity(client1.model, client2.model, "cosine")
-                euclidean_sim = calculate_similarity(client1.model, client2.model, "euclidean")
-                kl_sim = calculate_similarity(client1.model, client2.model, "kl")
+                cos_sim, euc_dis, kl_sim = 0, 0, 0
+                if target == "m":
+                    m1, m2 = client1.model, client2.model
+                    cos_sim = cal_model_sim(m1, m2, "cos")
+                    euc_dis = cal_model_sim(m1, m2, "euc")
+                    kl_sim = cal_model_sim(m1, m2, "kl")
+                elif target == "g":
+                    g1, g2 = subtract_model(client1.model, client1.pre_model), subtract_model(client2.model,
+                                                                                              client2.pre_model)
+                    cos_sim = cal_model_sim(g1, g2, "cos")
+                    euc_dis = cal_model_sim(g1, g2, "euc")
+                    kl_sim = cal_model_sim(g1, g2, "kl")
 
-                similarities["cosine"][i][j] = cos_sim
-                similarities["euclidean"][i][j] = euclidean_sim
+                similarities["cos"][i][j] = cos_sim
+                similarities["euc"][i][j] = euc_dis
                 similarities["kl"][i][j] = kl_sim
 
-                similarities["cosine"][j][i] = cos_sim
-                similarities["euclidean"][j][i] = euclidean_sim
+                similarities["cos"][j][i] = cos_sim
+                similarities["euc"][j][i] = euc_dis
                 similarities["kl"][j][i] = kl_sim
 
                 logging.info(f"Similarity between Client {client1.id} and Client {client2.id}:")
                 logging.info(f"  Cosine Similarity: {cos_sim}")
-                logging.info(f"  Euclidean Distance: {euclidean_sim}")
+                logging.info(f"  Euclidean Distance: {euc_dis}")
                 logging.info(f"  KL Divergence: {kl_sim}")
 
     return similarities
-
-
-model = CNN().to(device)
-client_loaders = split_cifar100()
-
-clients = [Client(loader, copy.deepcopy(model), i) for i, loader in enumerate(client_loaders)]
-
-similarity_results = train_and_evaluate(clients, epochs=2)
-print(similarity_results)
 
 
 def plot_similarity_matrices(similarities, client_ids):
@@ -168,7 +187,7 @@ def plot_similarity_matrices(similarities, client_ids):
         matrix = np.array(matrix)
 
         plt.figure(figsize=(8, 6))
-        plt.imshow(matrix)  # 选择颜色映射
+        plt.imshow(matrix)
 
         plt.colorbar(label=f"{metric.capitalize()} Similarity")
 
@@ -179,7 +198,6 @@ def plot_similarity_matrices(similarities, client_ids):
         plt.xlabel("Client ID")
         plt.ylabel("Client ID")
 
-        # 显示数值在热力图上
         for i in range(len(client_ids)):
             for j in range(len(client_ids)):
                 value = matrix[i][j]
@@ -190,4 +208,47 @@ def plot_similarity_matrices(similarities, client_ids):
         plt.show()
 
 
-plot_similarity_matrices(similarity_results, [0, 1, 2, 3, 4, 5])
+def plot_similarity_lines(like_data, dislike_data, title):
+    plt.figure(figsize=(8, 6))
+    plt.plot(like_data, marker='o', linestyle='-', color='b', label='like')
+    plt.plot(dislike_data, marker='x', linestyle='-', color='r', label='dislike')
+    plt.title(title, fontsize=16)
+    plt.xlabel('epochs', fontsize=12)
+    plt.ylabel('value', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    plt.show()
+
+
+def train_and_show(clients, epochs, target="m"):
+    like_cos_his = []
+    like_euc_dis = []
+    dislike_cos_his = []
+    dislike_euc_dis = []
+
+    center = 0
+    like = 1
+    dislike = 5
+
+    for i in range(epochs):
+        for client in clients:
+            client.train_local_model(1)
+
+        sim_res = get_similarities(clients, target)
+        like_cos_his.append(sim_res['cos'][center][like])
+        like_euc_dis.append(sim_res['euc'][center][like])
+        dislike_cos_his.append(sim_res['cos'][center][dislike])
+        dislike_euc_dis.append(sim_res['euc'][center][dislike])
+
+        plot_similarity_matrices(sim_res, [0, 1, 2, 3, 4, 5])
+
+    plot_similarity_lines(like_cos_his, dislike_cos_his,"cos_line")
+    plot_similarity_lines(like_euc_dis, dislike_euc_dis,"euc_line")
+
+
+model = CNN().to(device)
+client_loaders = split_cifar100()
+
+clients = [Client(loader, copy.deepcopy(model), i) for i, loader in enumerate(client_loaders)]
+
+train_and_show(clients, epochs=EPOCHS,target="g")
